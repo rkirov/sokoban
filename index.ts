@@ -18,9 +18,11 @@ enum Dir {
  */
 const MAX_SIZE = 50;
 /**
- * Whether to use hungarian matching for heuristic calculation for A* search, or a simpler heuristic.
+ * Maximum number of crates to use Hungarian algorithm.
+ * Hungarian is O(n³), so only worth it for small n where the better heuristic
+ * outweighs the computation cost. Set to 0 to always use simple heuristic.
  */
-const USE_HUNGARIAN = false;
+const HUNGARIAN_MAX_CRATES = 0;  // Disabled for now - simple is faster on microban
 /**
  * Maximum number of states to visit before giving up.
  */
@@ -88,7 +90,8 @@ class Level {
     }
 
     updateHeuristic() {
-        if (USE_HUNGARIAN) {
+        // Use Hungarian only for small levels where O(n³) cost is worth it
+        if (HUNGARIAN_MAX_CRATES > 0 && this.crates.length <= HUNGARIAN_MAX_CRATES) {
             this.updateHeuristicHungarian();
         } else {
             this.updateHeuristicSimple();
@@ -100,10 +103,14 @@ class Level {
     updateHeuristicHungarian() {
         let h = 0;
         let n = this.crates.length;
-        let a = Array.from({ length: n }, () => Array.from({ length: n }, () => 0));
-        for (let i = 0; i < n; i++) {
-            for (let j = 0; j < n; j++) {
-                a[i][j] = this.movesCountToNearestGrid[i].get(this.crates[j][0] + ',' + this.crates[j][1])!;
+        // Cost matrix: a[crateIndex][goalIndex] = push distance from crate to goal
+        let a = Array.from({ length: n }, () => Array.from({ length: n }, () => Infinity));
+        for (let crateIdx = 0; crateIdx < n; crateIdx++) {
+            const cratePos = this.crates[crateIdx];
+            const crateKey = cratePos[0] + ',' + cratePos[1];
+            for (let goalIdx = 0; goalIdx < n; goalIdx++) {
+                const dist = this.movesCountToGoal[goalIdx].get(crateKey);
+                a[crateIdx][goalIdx] = dist !== undefined ? dist : Infinity;
             }
         }
         let u = Array.from({ length: n }, () => 0);
@@ -133,6 +140,11 @@ class Level {
                         }
                     }
                 }
+                // If delta is still Infinity, no valid matching exists (bipartite deadlock)
+                if (delta === Infinity) {
+                    this.heuristic = Infinity;
+                    return;
+                }
                 for (let j = 0; j < n; j++) {
                     if (used[j]) {
                         u[p[j]] += delta;
@@ -152,6 +164,9 @@ class Level {
         for (let i = 0; i < n; i++) {
             h += a[p[i]][i];
         }
+        // DEBUG
+        if (h === Infinity) {
+        }
         this.heuristic = h;
     }
 
@@ -169,6 +184,7 @@ class Level {
         public name: string,
         private grid: Grid,
         public movesCountToNearestGrid: Map<string, number>[],
+        public movesCountToGoal: Map<string, number>[],  // [goalIndex] -> (position -> distance)
         public goals: Pos[],
         public deadEnds: Set<string>,
         public reachablePositions: Set<string>,
@@ -178,8 +194,8 @@ class Level {
 
     clone(): Level {
         let l = new Level(
-            this.name, this.grid, this.movesCountToNearestGrid, this.goals, this.deadEnds,
-            this.reachablePositions, this.reachablePositionsFromCrates, this.cuts);
+            this.name, this.grid, this.movesCountToNearestGrid, this.movesCountToGoal,
+            this.goals, this.deadEnds, this.reachablePositions, this.reachablePositionsFromCrates, this.cuts);
         l.hash = this.hash;
         if (this.topReachable) {
             l.hash ^= ZORBIST_PLAYER.get(this.topReachable![0] + ',' + this.topReachable![1])!;
@@ -351,6 +367,12 @@ function tryMove(level: Level, crateIndex: number, dir: Dir): Level | null {
     newLevel.player = crate;
     newLevel.topReachable = null;
     newLevel.moveCreate(crateIndex, dir);
+
+    // Check for freeze deadlock after the move
+    if (checkFreezeDeadlock(newLevel, nextPos)) {
+        return null;
+    }
+
     newLevel.updateHeuristic();
     return newLevel;
 }
@@ -418,10 +440,76 @@ function move(i: number, j: number, dir: Dir): Pos {
     }
 }
 
+/**
+ * Check if a box at position is frozen (can never move again).
+ * A box is frozen if it's blocked on both horizontal AND vertical axes.
+ * Uses a 'checking' set to detect circular dependencies (which mean frozen).
+ */
+function isFrozen(level: Level, pos: Pos, checking: Set<string> = new Set()): boolean {
+    const key = pos[0] + ',' + pos[1];
+    if (checking.has(key)) {
+        return true; // Circular dependency = frozen
+    }
+    checking.add(key);
+
+    const blockedH = isBlockedOnAxis(level, pos, 'horizontal', checking);
+    const blockedV = isBlockedOnAxis(level, pos, 'vertical', checking);
+
+    checking.delete(key);
+    return blockedH && blockedV;
+}
+
+/**
+ * Check if a box is blocked on a given axis (can't move in either direction on that axis).
+ * Blocked means: wall, out of grid, or another frozen box on BOTH sides.
+ */
+function isBlockedOnAxis(level: Level, pos: Pos, axis: 'horizontal' | 'vertical', checking: Set<string>): boolean {
+    const dirs = axis === 'horizontal' ? [Dir.Left, Dir.Right] : [Dir.Up, Dir.Down];
+
+    let blockedCount = 0;
+    for (const dir of dirs) {
+        const neighbor = move(pos[0], pos[1], dir);
+
+        if (!level.isInGrid(neighbor) || level.isWall(neighbor)) {
+            blockedCount++;
+        } else if (level.isCrate(neighbor) && isFrozen(level, neighbor, checking)) {
+            blockedCount++;
+        }
+    }
+
+    return blockedCount === 2; // Both directions blocked
+}
+
+/**
+ * Check if pushing a box to newPos creates a freeze deadlock.
+ * Returns true if the pushed box (or any box it freezes) is frozen and not on a goal.
+ */
+function checkFreezeDeadlock(level: Level, newPos: Pos): boolean {
+    if (!isFrozen(level, newPos, new Set())) {
+        return false; // Not frozen, no deadlock
+    }
+
+    // The pushed box is frozen - check if it's on a goal
+    if (!level.isGoal(newPos)) {
+        return true; // Frozen and not on goal = deadlock
+    }
+
+    // Also check any adjacent boxes that might now be frozen
+    for (const dir of [Dir.Up, Dir.Down, Dir.Left, Dir.Right]) {
+        const neighbor = move(newPos[0], newPos[1], dir);
+        if (level.isCrate(neighbor) && isFrozen(level, neighbor, new Set()) && !level.isGoal(neighbor)) {
+            return true; // Adjacent box is now frozen and not on goal
+        }
+    }
+
+    return false;
+}
+
 function precompute(level: Level) {
     level.reachablePositions = computerReachablePositions(level);
     level.reachablePositionsFromCrates = computerCreateReachablePositions(level);
     level.movesCountToNearestGrid = computeMovesCount(level);
+    level.movesCountToGoal = computeMovesCountToGoals(level);
     level.deadEnds = computeDeadEnds(level);
     level.cuts = computeCuts(level);
 }
@@ -522,6 +610,51 @@ function computeMovesCount(level: Level): Map<string, number>[] {
 }
 
 /**
+ * Computes push distances from every reachable position to each specific goal.
+ * Returns an array indexed by goal index, where each element is a Map from position to distance.
+ * Uses reverse BFS: starting from each goal, find all positions a box could be pulled FROM.
+ */
+function computeMovesCountToGoals(level: Level): Map<string, number>[] {
+    const result: Map<string, number>[] = [];
+
+    for (const goal of level.goals) {
+        const distances = new Map<string, number>();
+        const goalKey = goal[0] + ',' + goal[1];
+        distances.set(goalKey, 0);
+
+        // BFS backwards: find positions from which a box could be PUSHED to reach this goal.
+        // For a push in direction D: box moves from B to B+D, player moves from B-D to B.
+        // In reverse: if box ends at pos, it came from pos-D, player came from pos-2*D.
+        const queue: [Pos, number][] = [[goal, 0]];
+
+        while (queue.length > 0) {
+            const [pos, dist] = queue.shift()!;
+
+            for (const dir of [Dir.Up, Dir.Down, Dir.Left, Dir.Right]) {
+                // Reverse of push: box ended at pos by being pushed in direction 'dir'
+                // Box was at pos - dir (opposite direction)
+                // Player was at pos - 2*dir (behind the box)
+                const boxWasAt = move(pos[0], pos[1], oppositeDir(dir));
+                const playerWasAt = move(boxWasAt[0], boxWasAt[1], oppositeDir(dir));
+
+                if (!level.isInGrid(boxWasAt) || !level.isInGrid(playerWasAt)) continue;
+                if (level.isWall(boxWasAt) || level.isWall(playerWasAt)) continue;
+
+                const newKey = boxWasAt[0] + ',' + boxWasAt[1];
+                if (distances.has(newKey)) continue;
+
+                distances.set(newKey, dist + 1);
+                queue.push([boxWasAt, dist + 1]);
+            }
+        }
+
+        result.push(distances);
+    }
+
+    return result;
+}
+
+/**
  * Returns a list of dead ends in the level
  * Dead end is a position such that if a crate is pushed there, it's impossible to move it out.
  * 
@@ -535,57 +668,27 @@ function computeMovesCount(level: Level): Map<string, number>[] {
  * 
  */
 function computeDeadEnds(level: Level): Set<string> {
+    // A position is a dead end if a box there can never reach ANY goal.
+    // Use the precomputed movesCountToGoal to determine reachability.
     let deadEnds = new Set<string>();
-    for (let start of level.reachablePositions) {
-        let [x, y] = start.split(',').map(Number) as Pos;
-        // goals are not dead ends
+
+
+    for (let pos of level.reachablePositions) {
+        // Goals are never dead ends
+        let [x, y] = pos.split(',').map(Number) as Pos;
         if (level.isGoal([x, y])) {
             continue;
         }
-        let dirsToWall = [];
-        for (let d of [Dir.Up, Dir.Down, Dir.Left, Dir.Right]) {
-            let n = move(x, y, d);
-            if (level.isWall(n)) {
-                dirsToWall.push(d);
+        // Check if this position can reach at least one goal
+        let canReachGoal = false;
+        for (let goalDistances of level.movesCountToGoal) {
+            if (goalDistances.has(pos)) {
+                canReachGoal = true;
+                break;
             }
         }
-        if (dirsToWall.length === 0) {
-            continue;
-        }
-        if (dirsToWall.length > 2) {
-            deadEnds.add(x + ',' + y);
-            continue;
-        }
-        if (dirsToWall.length === 2) {
-            // check if blocks bot horizontal and vertical movement
-            let [d1, d2] = dirsToWall;
-            if ((d1 - d2) % 2 != 0) {
-                deadEnds.add(x + ',' + y);
-                continue;
-            }
-        }
-        let d = dirsToWall[0];
-        let otherDirs = d == Dir.Up || d == Dir.Down ? [Dir.Left, Dir.Right] : [Dir.Up, Dir.Down];
-        // go left and right until #
-        let good = true;
-        for (let otherDir of otherDirs) {
-            let next = move(x, y, otherDir);
-            while (!level.isWall(next)) {
-                if (level.isGoal(next)) {
-                    good = false;
-                    break;
-                }
-                // all of next should also be next to a wall
-                let sameDir = move(next[0], next[1], d);
-                if (!level.isWall(sameDir)) {
-                    good = false;
-                    break;
-                }
-                next = move(next[0], next[1], otherDir);
-            }
-        }
-        if (good) {
-            deadEnds.add(x + ',' + y);
+        if (!canReachGoal) {
+            deadEnds.add(pos);
         }
     }
     return deadEnds;
@@ -632,7 +735,7 @@ function computeCuts(level: Level): Map<string, Dir[]> {
         for (let d of [Dir.Up, Dir.Down, Dir.Left, Dir.Right]) {
             // run bfs to see if we can reach a goal
             let visited = new Set<string>();
-            function dfs(n: Pos) {
+            const dfs = (n: Pos, dir: Dir) => {
                 let key = n[0] + ',' + n[1];
                 if (visited.has(key)) {
                     return;
@@ -645,16 +748,16 @@ function computeCuts(level: Level): Map<string, Dir[]> {
                 }
                 visited.add(key);
                 if (level.isGoal(n)) {
-                    if (!v.includes(d)) {
-                        v.push(d);
+                    if (!v.includes(dir)) {
+                        v.push(dir);
                     }
                     return;
                 }
-                for (let d of [Dir.Up, Dir.Down, Dir.Left, Dir.Right]) {
-                    dfs(move(n[0], n[1], d));
+                for (let innerDir of [Dir.Up, Dir.Down, Dir.Left, Dir.Right]) {
+                    dfs(move(n[0], n[1], innerDir), dir);
                 }
-            }
-            dfs(move(x, y, d));
+            };
+            dfs(move(x, y, d), d);
         }
     }
     return cuts;
@@ -673,7 +776,7 @@ function parseFile(): Level[] {
                 precompute(level);
                 levels.push(level);
             }
-            level = new Level(name, [], [], [], new Set(), new Set(), [], new Map());
+            level = new Level(name, [], [], [], [], new Set(), new Set(), [], new Map());
         } else if (level) {
             for (let i = 0; i < line.length; i++) {
                 let c = line[i];
